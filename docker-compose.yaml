@@ -1,0 +1,23 @@
+services:
+  vlm-inference-server:
+    build: .
+    image: vlm-inference-server:latest
+    container_name: vlm-inference-server
+    ports:
+      - "8000:8000"
+    env_file: .env
+    volumes:
+      - ./models:/models:ro
+      - ./data:/data
+      - vlm-temp:/tmp/vlm4gis
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+volumes:
+  vlm-temp:

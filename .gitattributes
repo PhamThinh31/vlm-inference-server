@@ -1,0 +1,8 @@
+# Exclude notebooks from GitHub language statistics
+# (they exist as exploratory/demo material, not as primary source)
+*.ipynb linguist-documentation
+notebook/** linguist-documentation
+
+# Also treat stress-test result dumps as data, not code
+*.json linguist-generated=false
+stress_test_metrics.json linguist-generated

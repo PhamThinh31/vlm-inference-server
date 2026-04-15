@@ -1,0 +1,49 @@
+# Pre-commit runs on staged files. Keep hooks fast (<5s) or developers
+# will --no-verify around them. Slow checks (full test suite, type
+# checking everything) belong in CI, not here.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+      - id: check-merge-conflict
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        args: ["--fix", "--exit-non-zero-on-fix"]
+      - id: ruff-format
+
+  # Type-check only the changed files. Full-repo mypy runs in CI.
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.11.2
+    hooks:
+      - id: mypy
+        files: ^app/
+        args: ["--ignore-missing-imports", "--follow-imports=silent"]
+        additional_dependencies:
+          - pydantic==2.9.2
+          - pydantic-settings==2.5.2
+
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        args: ["--baseline", ".secrets.baseline"]
+        exclude: ^(tests/|docs/|CHANGELOG\.md)
+
+  # Fast test subset. Heavy / GPU tests belong in CI.
+  - repo: local
+    hooks:
+      - id: pytest-fast
+        name: pytest (unit only)
+        entry: pytest tests/unit -q --no-header
+        language: system
+        pass_filenames: false
+        stages: [pre-push]

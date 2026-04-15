@@ -1,0 +1,2 @@
+# Requirements for stress testing tools
+aiohttp>=3.8.0
