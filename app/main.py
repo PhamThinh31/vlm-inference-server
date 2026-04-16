@@ -14,7 +14,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Any
+from typing import Any, Iterator, NamedTuple
 
 import uvicorn
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
@@ -36,7 +36,6 @@ from .schemas import (
     GISPipelineResponse,
     HealthStatus,
     ImageClassification,
-    ImagePairData,
     ImageUpload,
     SessionCreate,
     SessionInfo,
@@ -164,24 +163,99 @@ async def _resolve_classify_images(
     )
 
 
-def _resolve_pair_from_base64(
-    pair: ImagePairData,
-) -> tuple[Image.Image, Image.Image, str, str]:
-    """Decode a base64-encoded garment / body pair."""
-    garment = _decode_base64_image(pair.garment.data)
-    body = _decode_base64_image(pair.body.data)
-    return garment, body, pair.garment.filename, pair.body.filename
+class _DirectPair(NamedTuple):
+    """A single pair resolved from direct (non-session) input.
+
+    `inference_id` is the filename the pipeline sees in the prompt —
+    short, cache-friendly, predictable. `display_name` is what the
+    response reports to the client — the original filename or full
+    path, so the caller can correlate results back to their request.
+    They are usually equal; they differ for server-path input where
+    we synthesise a cache-friendly inference id.
+    """
+    garment_image: Image.Image
+    body_image: Image.Image
+    garment_inference_id: str
+    body_inference_id: str
+    garment_display_name: str
+    body_display_name: str
 
 
-def _resolve_pair_from_paths(
-    garment_path: str, body_path: str
-) -> tuple[Image.Image, Image.Image, str, str]:
-    """Load a garment / body pair from server-local paths."""
-    garment = _load_path_image(garment_path)
-    body = _load_path_image(body_path)
-    g_name = f"garment_{os.path.splitext(os.path.basename(garment_path))[0]}.jpg"
-    b_name = f"body_{os.path.splitext(os.path.basename(body_path))[0]}.jpg"
-    return garment, body, g_name, b_name
+def _iter_direct_pairs(
+    request: "Task2Request | Task3Request",
+) -> Iterator[_DirectPair]:
+    """Yield pairs for base64 and server-path request modes.
+
+    Previously Tasks 2 and 3 each had ~40 lines inlining these two
+    branches with the same try/decode/load dance, and the server-path
+    branch tacked on a `result.garment_file = path` post-hoc mutation
+    in both places. This generator collapses both branches, yielding
+    the display name alongside the inference id so the caller can
+    assign the right value directly instead of mutating after the fact.
+    """
+    if request.image_data_pairs:
+        for pair in request.image_data_pairs:
+            yield _DirectPair(
+                garment_image=_decode_base64_image(pair.garment.data),
+                body_image=_decode_base64_image(pair.body.data),
+                garment_inference_id=pair.garment.filename,
+                body_inference_id=pair.body.filename,
+                garment_display_name=pair.garment.filename,
+                body_display_name=pair.body.filename,
+            )
+        return
+
+    if request.image_pairs:
+        for garment_path, body_path in request.image_pairs:
+            g_base = os.path.splitext(os.path.basename(garment_path))[0]
+            b_base = os.path.splitext(os.path.basename(body_path))[0]
+            yield _DirectPair(
+                garment_image=_load_path_image(garment_path),
+                body_image=_load_path_image(body_path),
+                garment_inference_id=f"garment_{g_base}.jpg",
+                body_inference_id=f"body_{b_base}.jpg",
+                garment_display_name=garment_path,
+                body_display_name=body_path,
+            )
+
+
+async def _resolve_session_pairs(
+    session_id: str,
+    explicit_pairs: list[tuple[str, str]] | None,
+    default_pair_deriver,
+) -> tuple[list[tuple[str, str]], dict[str, Image.Image]]:
+    """Resolve pairs for a session-based task call.
+
+    Returns `(pairs, images_dict)` ready for the batch pipeline call.
+    If the caller supplied `explicit_pairs`, we use them verbatim;
+    otherwise we pull Task 1 results off the session and hand them to
+    `default_pair_deriver` (each task has its own: `select_best_pairs`
+    for Task 2, `generate_all_pairs` for Task 3). Raises 404/400 with
+    the same messages the inline code used to produce.
+    """
+    session = await session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(404, f"Session {session_id} not found")
+
+    images_dict = {
+        fname: data.image
+        for fname, data in session.images.items()
+        if data.image
+    }
+
+    pairs = explicit_pairs
+    if not pairs:
+        task1_results = session.results.get("task1", [])
+        if not task1_results:
+            raise HTTPException(
+                400, "Run classification first (no Task 1 results)"
+            )
+        classifications = [ImageClassification(**r) for r in task1_results]
+        pairs = default_pair_deriver(classifications)
+
+    if not pairs:
+        raise HTTPException(400, "No valid pairs found")
+    return pairs, images_dict
 
 
 # ---------------------------------------------------------------------------
@@ -586,82 +660,43 @@ async def classify_images(request: Task1Request):
 @app.post("/task/attributes", response_model=Task2Response)
 async def extract_attributes(request: Task2Request):
     """Task 2: Extract garment attributes from image pairs."""
-
-    # --- Base64 uploads ---
-    if request.image_data_pairs:
+    # Direct input (base64 or server paths) — iterate one pair at a time.
+    if request.image_data_pairs or request.image_pairs:
         results: list[Task2Result] = []
         total_time = 0.0
-        for pair in request.image_data_pairs:
-            garment, body, g_name, b_name = _resolve_pair_from_base64(pair)
+        for pair in _iter_direct_pairs(request):
             start = time.time()
             result = await app.state.task2.extract_attributes(
-                garment_image=garment, body_image=body,
-                garment_id=g_name, body_id=b_name, use_cache=True,
+                garment_image=pair.garment_image, body_image=pair.body_image,
+                garment_id=pair.garment_inference_id,
+                body_id=pair.body_inference_id,
+                use_cache=True,
             )
             total_time += time.time() - start
+            # Report the caller's original path/filename, not the
+            # cache-friendly inference id we synthesised.
+            result.garment_file = pair.garment_display_name
+            result.body_file = pair.body_display_name
             results.append(result)
         return Task2Response(
-            session_id=None, results=results,
+            session_id="direct_inference" if request.image_pairs else None,
+            results=results,
             processing_time=total_time, pairs_processed=len(results),
         )
 
-    # --- Server paths ---
-    if request.image_pairs:
-        results = []
-        total_time = 0.0
-        for garment_path, body_path in request.image_pairs:
-            try:
-                garment, body, g_name, b_name = _resolve_pair_from_paths(
-                    garment_path, body_path,
-                )
-                start = time.time()
-                result = await app.state.task2.extract_attributes(
-                    garment_image=garment, body_image=body,
-                    garment_id=g_name, body_id=b_name, use_cache=True,
-                )
-                total_time += time.time() - start
-                result.garment_file = garment_path
-                result.body_file = body_path
-                results.append(result)
-            except Exception:
-                logger.exception(
-                    "Error processing pair %s, %s", garment_path, body_path,
-                )
-        return Task2Response(
-            session_id="direct_inference", results=results,
-            processing_time=total_time, pairs_processed=len(results),
-        )
-
-    # --- Session-based ---
     if request.session_id:
-        session = await session_manager.get_session(request.session_id)
-        if not session:
-            raise HTTPException(404, f"Session {request.session_id} not found")
-
-        images_dict = {
-            fname: data.image
-            for fname, data in session.images.items()
-            if data.image
-        }
-
-        pairs = request.pairs
-        if not pairs:
-            task1_results = session.results.get("task1", [])
-            if not task1_results:
-                raise HTTPException(
-                    400, "Run classification first (no Task 1 results)"
-                )
-            classifications = [ImageClassification(**r) for r in task1_results]
-            pairs = app.state.task2.select_best_pairs(classifications, max_pairs=5)
-        if not pairs:
-            raise HTTPException(400, "No valid pairs found")
-
+        pairs, images_dict = await _resolve_session_pairs(
+            request.session_id,
+            explicit_pairs=request.pairs,
+            default_pair_deriver=lambda cls: app.state.task2.select_best_pairs(
+                cls, max_pairs=5,
+            ),
+        )
         start_time = time.time()
         results = await app.state.task2.extract_attributes_batch(
             pairs=pairs, images_dict=images_dict, use_cache=True,
         )
         processing_time = time.time() - start_time
-
         await session_manager.store_results(
             request.session_id, "task2", [r.dict() for r in results],
         )
@@ -675,112 +710,84 @@ async def extract_attributes(request: Task2Request):
     )
 
 
+def _task3_response(
+    session_id: str | None,
+    validations: list[ValidationResult],
+    processing_time: float,
+) -> Task3Response:
+    """Bundle the valid/invalid counting that every Task 3 return path does."""
+    valid_count = sum(1 for v in validations if v.is_valid)
+    return Task3Response(
+        session_id=session_id,
+        validations=validations,
+        processing_time=processing_time,
+        total_validated=len(validations),
+        valid_count=valid_count,
+        invalid_count=len(validations) - valid_count,
+    )
+
+
 @app.post("/task/validate", response_model=Task3Response)
 async def validate_pairs(request: Task3Request):
     """Task 3: Validate garment-body pair compatibility."""
-
-    # --- Base64 uploads ---
-    if request.image_data_pairs:
+    # Direct input (base64 or server paths). Each pair is wrapped in
+    # try/except so one bad pair yields a parse_failed ValidationResult
+    # rather than tearing down the whole request — matches the
+    # return_exceptions=True contract in validate_pairs_batch.
+    if request.image_data_pairs or request.image_pairs:
         validations: list[ValidationResult] = []
         total_time = 0.0
-        for pair in request.image_data_pairs:
+        for pair in _iter_direct_pairs(request):
             try:
-                garment, body, g_name, b_name = _resolve_pair_from_base64(pair)
                 start = time.time()
                 result = await app.state.task3.validate_pair(
-                    garment_image=garment, body_image=body,
-                    garment_id=g_name, body_id=b_name, use_cache=True,
+                    garment_image=pair.garment_image, body_image=pair.body_image,
+                    garment_id=pair.garment_inference_id,
+                    body_id=pair.body_inference_id,
+                    use_cache=True,
                 )
                 total_time += time.time() - start
-                result.garment_file = g_name
-                result.body_file = b_name
+                result.garment_file = pair.garment_display_name
+                result.body_file = pair.body_display_name
                 validations.append(result)
             except Exception as exc:
-                logger.exception("Error validating pair")
+                logger.exception(
+                    "Error validating pair (%s, %s)",
+                    pair.garment_display_name, pair.body_display_name,
+                )
                 validations.append(ValidationResult(
-                    garment_file=pair.garment.filename,
-                    body_file=pair.body.filename,
-                    is_valid=False, confidence=None,
-                    reasoning=None,
+                    garment_file=pair.garment_display_name,
+                    body_file=pair.body_display_name,
+                    is_valid=False, confidence=None, reasoning=None,
                     parse_failed=True,
                     error=TaskError(code=ErrorCode.PROCESSING_ERROR, detail=str(exc)),
                 ))
-        valid_count = sum(1 for v in validations if v.is_valid)
-        return Task3Response(
-            session_id=None, validations=validations,
-            processing_time=total_time, total_validated=len(validations),
-            valid_count=valid_count, invalid_count=len(validations) - valid_count,
+        return _task3_response(
+            session_id="direct_inference" if request.image_pairs else None,
+            validations=validations,
+            processing_time=total_time,
         )
 
-    # --- Server paths ---
-    if request.image_pairs:
-        validations = []
-        total_time = 0.0
-        for garment_path, body_path in request.image_pairs:
-            try:
-                garment, body, g_name, b_name = _resolve_pair_from_paths(
-                    garment_path, body_path,
-                )
-                start = time.time()
-                result = await app.state.task3.validate_pair(
-                    garment_image=garment, body_image=body,
-                    garment_id=g_name, body_id=b_name, use_cache=True,
-                )
-                total_time += time.time() - start
-                result.garment_file = garment_path
-                result.body_file = body_path
-                validations.append(result)
-            except Exception:
-                logger.exception(
-                    "Error validating pair %s, %s", garment_path, body_path,
-                )
-        valid_count = sum(1 for v in validations if v.is_valid)
-        return Task3Response(
-            session_id="direct_inference", validations=validations,
-            processing_time=total_time, total_validated=len(validations),
-            valid_count=valid_count, invalid_count=len(validations) - valid_count,
-        )
-
-    # --- Session-based ---
     if request.session_id:
-        session = await session_manager.get_session(request.session_id)
-        if not session:
-            raise HTTPException(404, f"Session {request.session_id} not found")
-
-        images_dict = {
-            fname: data.image
-            for fname, data in session.images.items()
-            if data.image
-        }
-
-        pairs = request.pairs
-        if not pairs:
-            task1_results = session.results.get("task1", [])
-            if not task1_results:
-                raise HTTPException(
-                    400, "Run classification first (no Task 1 results)"
-                )
-            classifications = [ImageClassification(**r) for r in task1_results]
-            pairs = app.state.task3.generate_all_pairs(
-                classifications, max_pairs=request.max_pairs,
-            )
-        if not pairs:
-            raise HTTPException(400, "No valid pairs found")
-
+        pairs, images_dict = await _resolve_session_pairs(
+            request.session_id,
+            explicit_pairs=request.pairs,
+            default_pair_deriver=lambda cls: app.state.task3.generate_all_pairs(
+                cls, max_pairs=request.max_pairs,
+            ),
+        )
         start_time = time.time()
         validations = await app.state.task3.validate_pairs_batch(
             pairs=pairs, images_dict=images_dict, use_cache=True,
         )
         processing_time = time.time() - start_time
-        valid_count = sum(1 for v in validations if v.is_valid)
-
         await session_manager.store_results(
             request.session_id, "task3", [v.dict() for v in validations],
         )
-        return Task3Response(
-            session_id=request.session_id, validations=validations,
-            processing_time=processing_time, total_validated=len(validations),
-            valid_count=valid_count, invalid_count=len(validations) - valid_count,
+        return _task3_response(
+            session_id=request.session_id,
+            validations=validations,
+            processing_time=processing_time,
         )
 
     raise HTTPException(
